@@ -398,23 +398,24 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
 export function liveRows(snapshot: Snapshot): LiveRow[] {
-  return snapshot.protocols
-    .filter((p) => !isPreToken(p) && p.category !== 'CEX')
-    .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd)
-    .slice(0, 24)
-    .map((p) => ({
-      slug: p.slug,
-      name: p.name,
-      category: p.category,
-      chains: p.chains,
-      tvl_usd: p.tvl_usd,
-      mcap_usd: p.mcap_usd,
-      change_7d: p.change_7d,
-    }));
+  const byMarketCap = (a: SnapshotProtocol, b: SnapshotProtocol): number =>
+    (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd;
+  const live = snapshot.protocols.filter((p) => !isPreToken(p) && p.category !== 'CEX');
+  live.sort(byMarketCap);
+  return live.slice(0, 24).map((p) => ({
+    slug: p.slug,
+    name: p.name,
+    category: p.category,
+    chains: p.chains,
+    tvl_usd: p.tvl_usd,
+    mcap_usd: p.mcap_usd,
+    change_7d: p.change_7d,
+  }));
 }
 
 /** A board row's compact form for data.js, with the farm plan generated in the page. */
 export function radarRow(row: BoardRow): RadarRow {
+  const m = row.model;
   return {
     rank: row.rank,
     slug: row.slug,
@@ -427,9 +428,9 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
-    growth_multiplier: row.model.growth_multiplier,
-    maturity_multiplier: row.model.maturity_multiplier,
-    chain_multiplier: row.model.chain_multiplier,
+    growth_multiplier: m.growth_multiplier,
+    maturity_multiplier: m.maturity_multiplier,
+    chain_multiplier: m.chain_multiplier,
   };
 }
 
@@ -437,7 +438,7 @@ export function radarRow(row: BoardRow): RadarRow {
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
-  const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const watchlist = new Set(snapshot.watchlist);
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -447,12 +448,24 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     watchlist: snapshot.watchlist,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
-    early_size: early,
+    early_size: board.filter((r) => !watchlist.has(r.slug)).length,
     live_size: live.length,
     rows: board.map(radarRow),
     live,
   };
   return { board, radar };
+}
+
+/** Read an optional number field, or null when it is absent or not a finite number. */
+function optNumber(record: Record<string, unknown>, key: string): number | null {
+  const v = record[key];
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+/** Read an optional string field, or null when it is absent or not a string. */
+function optString(record: Record<string, unknown>, key: string): string | null {
+  const v = record[key];
+  return typeof v === 'string' ? v : null;
 }
 
 /** The snapshot out of a file's text, refused unless it is the shape the model scores. */
@@ -463,57 +476,73 @@ export function parseSnapshot(text: string): Snapshot {
   } catch {
     throw new SnapshotError('snapshot.json is not JSON');
   }
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new SnapshotError('snapshot.json is not a JSON object');
-  const o = raw as Record<string, unknown>;
-  if (typeof o.as_of !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(o.as_of)) throw new SnapshotError('snapshot.json has no as_of date');
-  if (typeof o.source !== 'string') throw new SnapshotError('snapshot.json has no source');
-  if (typeof o.floor_usd !== 'number' || !Number.isSafeInteger(o.floor_usd) || o.floor_usd <= 0) throw new SnapshotError('snapshot.json has no floor_usd');
-  if (!Array.isArray(o.protocols)) throw new SnapshotError('snapshot.json has no protocols array');
-  if (!Array.isArray(o.watchlist) || o.watchlist.some((s) => typeof s !== 'string')) throw new SnapshotError('snapshot.json has no watchlist of slugs');
-  const protocols = o.protocols.map((v, i) => {
-    if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new SnapshotError(`snapshot.json's protocol ${i} is not an object`);
-    const p = v as Record<string, unknown>;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new SnapshotError('snapshot.json is not a JSON object');
+  }
+  const doc = raw as Record<string, unknown>;
+  const asOf = doc.as_of;
+  if (typeof asOf !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(asOf)) {
+    throw new SnapshotError('snapshot.json has no as_of date');
+  }
+  if (typeof doc.source !== 'string') throw new SnapshotError('snapshot.json has no source');
+  const floor = doc.floor_usd;
+  if (typeof floor !== 'number' || !Number.isSafeInteger(floor) || floor <= 0) {
+    throw new SnapshotError('snapshot.json has no floor_usd');
+  }
+  if (!Array.isArray(doc.protocols)) throw new SnapshotError('snapshot.json has no protocols array');
+  const watchlist = doc.watchlist;
+  if (!Array.isArray(watchlist) || watchlist.some((s) => typeof s !== 'string')) {
+    throw new SnapshotError('snapshot.json has no watchlist of slugs');
+  }
+  const protocols = doc.protocols.map((entry, i) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new SnapshotError(`snapshot.json's protocol ${i} is not an object`);
+    }
+    const p = entry as Record<string, unknown>;
     if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) {
       throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug, a name or a TVL`);
     }
+    const chains = Array.isArray(p.chains) ? p.chains.filter((c): c is string => typeof c === 'string') : [];
     return {
       slug: p.slug,
       name: p.name,
-      category: typeof p.category === 'string' ? p.category : null,
-      chains: Array.isArray(p.chains) ? p.chains.filter((c): c is string => typeof c === 'string') : [],
+      category: optString(p, 'category'),
+      chains,
       tvl_usd: p.tvl_usd,
-      change_7d: typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : null,
-      mcap_usd: typeof p.mcap_usd === 'number' && Number.isFinite(p.mcap_usd) ? p.mcap_usd : null,
-      listed_at: typeof p.listed_at === 'string' ? p.listed_at : null,
-      gecko_id: typeof p.gecko_id === 'string' ? p.gecko_id : null,
-      symbol: typeof p.symbol === 'string' ? p.symbol : null,
+      change_7d: optNumber(p, 'change_7d'),
+      mcap_usd: optNumber(p, 'mcap_usd'),
+      listed_at: optString(p, 'listed_at'),
+      gecko_id: optString(p, 'gecko_id'),
+      symbol: optString(p, 'symbol'),
     };
   });
-  return {
-    as_of: o.as_of,
-    source: o.source,
-    floor_usd: o.floor_usd,
-    protocols,
-    watchlist: o.watchlist as string[],
-  };
+  return { as_of: asOf, source: doc.source, floor_usd: floor, protocols, watchlist: watchlist as string[] };
 }
 
 /** Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied value, and farm steps. */
 export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null {
-  const slugs = new Set(board.map((r) => r.slug));
-  const missing = snapshot.watchlist.filter((s) => !slugs.has(s));
-  if (missing.length > 0) return `the board misses ${missing.length} watchlist slug${missing.length === 1 ? '' : 's'}: ${missing.slice(0, 5).join(', ')}`;
+  const onBoard = new Set(board.map((r) => r.slug));
+  const missing = snapshot.watchlist.filter((s) => !onBoard.has(s));
+  if (missing.length > 0) {
+    return `the board misses ${missing.length} watchlist slug${missing.length === 1 ? '' : 's'}: ${missing.slice(0, 5).join(', ')}`;
+  }
   const ranks = board.map((r) => r.rank).sort((a, b) => a - b);
-  for (let i = 0; i < ranks.length; i++) if (ranks[i] !== i + 1) return `rank ${i + 1} is ${ranks[i]}`;
-  for (let i = 1; i < board.length; i++) if (board[i]!.implied_value_usd > board[i - 1]!.implied_value_usd) return `row ${i + 1} outranks row ${i} on implied value`;
-  if (board.length >= 2 && board[0]!.implied_value_usd === board[board.length - 1]!.implied_value_usd) {
-    return `all ${board.length} rows share the same implied value $${board[0]!.implied_value_usd}: a board that ranks nothing by value is not a ranking`;
+  const badRank = ranks.findIndex((rank, i) => rank !== i + 1);
+  if (badRank >= 0) return `rank ${badRank + 1} is ${ranks[badRank]}`;
+  const outOfOrder = board.findIndex((r, i) => i > 0 && r.implied_value_usd > board[i - 1]!.implied_value_usd);
+  if (outOfOrder > 0) return `row ${outOfOrder + 1} outranks row ${outOfOrder} on implied value`;
+  const first = board[0]?.implied_value_usd;
+  const last = board[board.length - 1]?.implied_value_usd;
+  if (board.length >= 2 && first !== undefined && first === last) {
+    return `all ${board.length} rows share the same implied value $${first}: a board that ranks nothing by value is not a ranking`;
   }
   for (const r of board) {
-    const steps = r.farm_steps;
-    if (steps.length < 3 || steps.length > 12) return `${r.slug} has ${steps.length} farm steps`;
-    for (const s of steps) if (s.length < 20 || s.length > 600) return `${r.slug} has a farm step of ${s.length} characters`;
-    if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
+    if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) {
+      return `${r.slug} has implied value ${r.implied_value_usd}`;
+    }
+    if (r.farm_steps.length < 3 || r.farm_steps.length > 12) return `${r.slug} has ${r.farm_steps.length} farm steps`;
+    const badStep = r.farm_steps.find((s) => s.length < 20 || s.length > 600);
+    if (badStep !== undefined) return `${r.slug} has a farm step of ${badStep.length} characters`;
   }
   return null;
 }
